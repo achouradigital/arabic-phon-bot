@@ -1,7 +1,7 @@
 {
-  "name": "achoura-phonetic-bot",
+  "name": "arabic-phon-bot",
   "version": "1.0.0",
-  "description": "Slack slash command to transliterate Arabic names to phonetic Latin (context-aware)",
+  "description": "Arabic Phon Bot — Slack slash command to transliterate Arabic names to phonetic Latin (context-aware)",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
@@ -10,6 +10,7 @@
     "node": ">=16"
   },
   "dependencies": {
+    "axios": "^1.4.0",
     "body-parser": "^1.20.2",
     "express": "^4.18.2"
   },
