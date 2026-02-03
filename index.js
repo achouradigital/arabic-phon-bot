@@ -1,19 +1,27 @@
+/**
+ * Arabic Phon Bot
+ * Endpoint /phon pour Slack (slash command)
+ *
+ * - ACK immédiat pour éviter le timeout Slack (<= 3s)
+ * - Envoi asynchrone du résultat à response_url (avec retry + timeout)
+ * - Fallback vers Slack Web API (chat.postMessage) si response_url échoue
+ * - Vérification optionnelle de la signature via SLACK_SIGNING_SECRET
+ *
+ * Usage:
+ *  - Mettre SLACK_SIGNING_SECRET pour activer la vérif. (optionnel)
+ *  - Mettre SLACK_BOT_TOKEN pour fallback chat.postMessage (optionnel)
+ */
+
 const express = require("express");
 const bodyParser = require("body-parser");
 const crypto = require("crypto");
+const axios = require("axios");
 
-// try to require a transliteration lib if present, otherwise fallback
-let arabicTranslitPkg = null;
-try {
-  arabicTranslitPkg = require("arabic-transliteration");
-} catch (e) {
-  arabicTranslitPkg = null;
-}
-const transliterateLib = (arabicTranslitPkg && (arabicTranslitPkg.transliterate || arabicTranslitPkg.default || arabicTranslitPkg)) || null;
+const APP_NAME = "Arabic Phon Bot";
 
 const app = express();
 
-// capture raw body for optional Slack signature verification
+// raw body capture for Slack signature verification
 app.use(bodyParser.urlencoded({
   extended: true,
   verify: (req, res, buf) => { req.rawBody = buf; }
@@ -22,23 +30,33 @@ app.use(bodyParser.json({
   verify: (req, res, buf) => { req.rawBody = buf; }
 }));
 
-app.get("/", (req, res) => res.send("Achoura Phonetic Bot is running!"));
+// Simple request logger for debugging
+app.use((req, res, next) => {
+  console.log(`[${APP_NAME}] [REQ] ${new Date().toISOString()} ${req.method} ${req.url}`);
+  // For privacy/security, avoid logging huge bodies in production
+  console.log("Headers:", req.headers);
+  console.log("Body:", req.body);
+  next();
+});
 
-// Optional Slack signature verification using SLACK_SIGNING_SECRET
+// --- Slack signature verification (optional)
 function isValidSlackRequest(req) {
   const signingSecret = process.env.SLACK_SIGNING_SECRET;
-  if (!signingSecret) return true; // disabled when not provided
+  if (!signingSecret) return true; // disabled if not provided
 
-  const ts = req.headers["x-slack-request-timestamp"];
+  const timestamp = req.headers["x-slack-request-timestamp"];
   const sig = req.headers["x-slack-signature"];
-  if (!ts || !sig) return false;
+  if (!timestamp || !sig) return false;
 
-  const age = Math.abs(Math.floor(Date.now() / 1000) - Number(ts));
-  if (age > 60 * 5) return false; // too old
+  const FIVE_MINUTES = 60 * 5;
+  if (Math.abs(Math.floor(Date.now() / 1000) - Number(timestamp)) > FIVE_MINUTES) {
+    return false;
+  }
 
-  const base = `v0:${ts}:${req.rawBody ? req.rawBody.toString() : ""}`;
+  const base = `v0:${timestamp}:${req.rawBody ? req.rawBody.toString() : ""}`;
   const hmac = crypto.createHmac("sha256", signingSecret).update(base).digest("hex");
   const computed = `v0=${hmac}`;
+
   try {
     return crypto.timingSafeEqual(Buffer.from(computed), Buffer.from(sig));
   } catch (e) {
@@ -46,17 +64,23 @@ function isValidSlackRequest(req) {
   }
 }
 
-// Keep shadda and basic spacing for contextual rules
+// --- Transliteration utilities (fallback + optional lib)
+let arabicTranslitPkg = null;
+try {
+  arabicTranslitPkg = require("arabic-transliteration");
+} catch (e) {
+  arabicTranslitPkg = null;
+}
+const transliterateLib = (arabicTranslitPkg && (arabicTranslitPkg.transliterate || arabicTranslitPkg.default || arabicTranslitPkg)) || null;
+
 function normalizeArabicKeepShadda(text) {
   if (!text) return "";
   return String(text).replace(/\u200F/g, "").replace(/\s+/g, " ").trim();
 }
-
-// Remove short vowel diacritics, normalize alef forms and common chars
 function stripDiacritics(text) {
   if (!text) return "";
   return String(text)
-    .replace(/[\u064B-\u0652\u0670]/g, "") // remove short vowel diacritics
+    .replace(/[\u064B-\u0652\u0670]/g, "")
     .replace(/[إأآ]/g, "ا")
     .replace(/ى/g, "ي")
     .replace(/ؤ/g, "و")
@@ -67,7 +91,6 @@ function stripDiacritics(text) {
     .trim();
 }
 
-// basic map for heuristics and fallback
 const arabicToLatin = {
   "ا":"a","أ":"a","إ":"a","آ":"a",
   "ب":"b","ت":"t","ث":"th","ج":"j","ح":"h","خ":"kh",
@@ -77,16 +100,9 @@ const arabicToLatin = {
   "ف":"f","ق":"q","ك":"k","ل":"l","م":"m","ن":"n",
   "ه":"h","و":"w","ي":"y","ء":"'","ئ":"y","ؤ":"w","ة":"a","ى":"a"
 };
-
-// sun letters for assimilation rule
 const sunLetters = new Set(["ت","ث","د","ذ","ر","ز","س","ش","ص","ض","ط","ظ","ل","ن"]);
+function capitalizeWord(s) { return s ? s.charAt(0).toUpperCase() + s.slice(1) : s; }
 
-function capitalizeWord(s) {
-  if (!s) return s;
-  return s.charAt(0).toUpperCase() + s.slice(1);
-}
-
-// fallback very conservative transliteration
 function fallbackTransliterate(text) {
   if (!text) return "";
   const s = stripDiacritics(text);
@@ -98,8 +114,6 @@ function fallbackTransliterate(text) {
   }
   return out.split(/\s+/).map(capitalizeWord).join(" ");
 }
-
-// Convert scientific translit (from lib) to human-friendly phonetic
 function scientificToPhonetic(scientific) {
   if (!scientific) return "";
   let s = scientific;
@@ -120,13 +134,11 @@ function scientificToPhonetic(scientific) {
   }).join(" ");
 }
 
-// Apply contextual rules using original Arabic (rawKeep includes shadda etc.)
 function applyContextualRules(originalArabic, phoneticLatin) {
   if (!originalArabic || !phoneticLatin) return phoneticLatin;
   let out = phoneticLatin;
   const raw = originalArabic.trim();
 
-  // Assimilation of "ال" before sun letters -> Ash-, Ad-, ...
   if (raw.startsWith("ال") && raw.length >= 2) {
     const secondLetter = raw[2] || raw[1];
     if (sunLetters.has(secondLetter)) {
@@ -137,7 +149,6 @@ function applyContextualRules(originalArabic, phoneticLatin) {
     }
   }
 
-  // shadda doubling: for each letter doubled by shadda, double its latin mapping once
   if (raw.includes("ّ")) {
     for (let i = 0; i < raw.length; i++) {
       const ch = raw[i];
@@ -153,7 +164,6 @@ function applyContextualRules(originalArabic, phoneticLatin) {
     }
   }
 
-  // taa marbuta: if ends with ة, ensure final 'a'
   if (raw.endsWith("ة")) {
     if (!/[aA]$/.test(out)) out = out + "a";
   }
@@ -163,10 +173,8 @@ function applyContextualRules(originalArabic, phoneticLatin) {
   return out;
 }
 
-// Main smart transliteration: use lib if available, fallback otherwise, then apply heuristics
 function smartTransliterate(arabicText) {
   if (!arabicText) return "Nom vide";
-
   const rawKeep = normalizeArabicKeepShadda(arabicText);
   const stripped = stripDiacritics(rawKeep);
 
@@ -187,56 +195,116 @@ function smartTransliterate(arabicText) {
   return phonetic;
 }
 
-// /phon endpoint expects form-encoded 'text' like Slack slash command
-app.post("/phon", async (req, res) => {
-  try {
-    if (!isValidSlackRequest(req)) {
-      return res.status(400).send("Invalid Slack request signature");
-    }
+// --- Robust /phon handler (ACK + async response)
+app.post("/phon", (req, res) => {
+  const now = new Date().toISOString();
+  console.log(`[${APP_NAME}] [${now}] /phon received`);
+  console.log("headers:", req.headers);
+  console.log("body:", req.body);
 
-    const text = (req.body && req.body.text) ? String(req.body.text).trim() : "";
-    if (!text) {
-      return res.json({
-        response_type: "ephemeral",
-        text: "❌ Veuillez fournir un nom arabe. Exemple: /phon أحمد بن محمد"
-      });
-    }
+  if (!isValidSlackRequest(req)) {
+    console.warn(`[${APP_NAME}] Invalid Slack signature - rejecting`);
+    return res.status(400).send("Invalid Slack request signature");
+  }
 
-    const normalized = stripDiacritics(text).replace(/\s+/g, " ").trim();
-    const tokens = normalized.split(" ").filter(Boolean);
+  const text = (req.body && req.body.text) ? String(req.body.text).trim() : "";
+  const responseUrl = req.body && req.body.response_url;
+  const channelId = req.body && req.body.channel_id;
 
-    const translitTokens = [];
-    for (let i = 0; i < tokens.length; i++) {
-      const tok = tokens[i];
-      if (tok === "بن" || tok === "ابن") {
-        translitTokens.push("bin");
-        continue;
-      }
-      // if token starts with definite article, use original slice for contextual rule
-      if (tok.startsWith("ال") && tok.length > 2) {
-        // find occurrence in original raw to preserve shadda if any
-        const idx = text.indexOf(tok);
-        const origPiece = (idx >= 0) ? text.substr(idx, tok.length) : tok;
-        translitTokens.push(smartTransliterate(origPiece));
-      } else {
-        translitTokens.push(smartTransliterate(tok));
-      }
-    }
-
-    const output = translitTokens.filter(Boolean).join(" ");
-
-    return res.json({
-      response_type: "in_channel",
-      text: `🔤 Phonetic: *${output}*`
-    });
-  } catch (err) {
-    console.error("Error /phon:", err);
+  if (!text) {
     return res.json({
       response_type: "ephemeral",
-      text: "❌ Erreur interne lors de la translittération."
+      text: "❌ Veuillez fournir un nom arabe. Exemple: /phon أحمد بن محمد"
     });
   }
+
+  // ACK immédiat
+  try {
+    res.status(200).json({ response_type: "ephemeral", text: "🔄 Traitement en cours…" });
+  } catch (e) {
+    console.error(`[${APP_NAME}] Erreur en envoyant ACK:`, e);
+  }
+
+  // Traitement asynchrone
+  (async () => {
+    try {
+      const translit = smartTransliterate(text);
+      const message = {
+        response_type: "in_channel",
+        text: `🔤 Phonetic: *${translit}*`
+      };
+
+      if (responseUrl) {
+        const maxAttempts = 2;
+        let lastErr = null;
+        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+          try {
+            console.log(`[${APP_NAME}] [${now}] Posting to response_url (attempt ${attempt})`);
+            await axios.post(responseUrl, message, {
+              headers: { "Content-Type": "application/json" },
+              timeout: 5000
+            });
+            console.log(`[${APP_NAME}] [${now}] Posted result to response_url`);
+            lastErr = null;
+            break;
+          } catch (err) {
+            lastErr = err;
+            console.error(`[${APP_NAME}] [${now}] Attempt ${attempt} failed posting to response_url:`, err.message,
+              err.response && err.response.status, err.response && err.response.data);
+            await new Promise(r => setTimeout(r, 500 * attempt));
+          }
+        }
+
+        if (lastErr) {
+          const botToken = process.env.SLACK_BOT_TOKEN;
+          if (botToken && channelId) {
+            try {
+              console.log(`[${APP_NAME}] [${now}] response_url failed, trying chat.postMessage fallback`);
+              await axios.post("https://slack.com/api/chat.postMessage", {
+                channel: channelId,
+                text: message.text,
+                mrkdwn: true
+              }, {
+                headers: { Authorization: `Bearer ${botToken}`, "Content-Type": "application/json" },
+                timeout: 5000
+              });
+              console.log(`[${APP_NAME}] [${now}] Posted result using chat.postMessage fallback`);
+            } catch (err2) {
+              console.error(`[${APP_NAME}] [${now}] chat.postMessage fallback failed:`, err2.message, err2.response && err2.response.data);
+            }
+          } else {
+            console.warn(`[${APP_NAME}] [${now}] response_url failed and no SLACK_BOT_TOKEN/channelId for fallback`);
+          }
+        }
+      } else {
+        const botToken = process.env.SLACK_BOT_TOKEN;
+        if (botToken && channelId) {
+          try {
+            await axios.post("https://slack.com/api/chat.postMessage", {
+              channel: channelId,
+              text: message.text,
+              mrkdwn: true
+            }, {
+              headers: { Authorization: `Bearer ${botToken}`, "Content-Type": "application/json" },
+              timeout: 5000
+            });
+            console.log(`[${APP_NAME}] [${now}] Posted result using chat.postMessage (no response_url)`);
+          } catch (err) {
+            console.error(`[${APP_NAME}] [${now}] chat.postMessage failed:`, err.message, err.response && err.response.data);
+          }
+        } else {
+          console.log(`[${APP_NAME}] [${now}] No response_url and no bot token - cannot deliver final message`);
+        }
+      }
+    } catch (err) {
+      console.error(`[${APP_NAME}] [${now}] Unexpected error during async processing:`, err);
+    }
+  })();
 });
 
+// Health check
+app.get("/", (req, res) => res.send(`${APP_NAME} is running!`));
+
+// Start server (Railway provides PORT)
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Achoura Phonetic Bot running on port ${PORT}`));
+app.listen(PORT, () => console.log(`${APP_NAME} running on port ${PORT}`));
